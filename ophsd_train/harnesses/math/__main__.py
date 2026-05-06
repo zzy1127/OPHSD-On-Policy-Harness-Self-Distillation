@@ -1,0 +1,6 @@
+"""Allow ``python -m harnesses.math`` to invoke the standalone runner."""
+
+from .run import main
+
+if __name__ == "__main__":
+    main()

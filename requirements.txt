@@ -1,0 +1,30 @@
+# Core training dependencies — kept minimal; install verl separately.
+# Pin major versions only; use the same versions as your verl install when possible.
+
+# Modelling stack
+torch>=2.4.0
+transformers>=4.45.0
+sentencepiece
+hydra-core>=1.3
+omegaconf>=2.3
+ray[default]>=2.20
+
+# Inference (colocated with training)
+vllm>=0.6.0
+openai>=1.30          # client used by every harness to talk to vLLM
+
+# Data
+pyarrow>=15.0
+pandas>=2.0
+numpy>=1.26
+
+# Retrieval
+sentence-transformers>=2.7    # used by Draft-Verify (lawbench, uspto)
+scikit-learn>=1.3             # TF-IDF fallback for the embedder
+
+# Math eval
+math-verify>=0.5              # symbolic answer equivalence (math_reward + harnesses.math.evaluate)
+
+# verl is required but not pip-installable from PyPI.
+# Install it manually, e.g.:
+#   pip install -e <path-to-verl>

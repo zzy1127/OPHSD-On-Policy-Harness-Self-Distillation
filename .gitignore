@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.venv/
+venv/
+
+# Generated parquet files (regenerate via data_prep/prepare_*.py)
+data/*/train.parquet
+data/*/val*.parquet
+data/*/train_embeddings.npy
+
+# Trainer outputs / checkpoints
+outputs/
+checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

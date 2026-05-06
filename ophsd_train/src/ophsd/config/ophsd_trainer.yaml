@@ -1,0 +1,267 @@
+# ============================================================================
+# OPHSD (On-Policy Harness Self-Distillation) Trainer config
+# ============================================================================
+# The student p_S(·|x) is also the teacher: given a question x, an external
+# reasoning *harness* (Plan-Solve for math, Draft-Verify for text classification)
+# orchestrates several calls to the *current* student via the colocated vLLM
+# server, producing a privileged context z(x).  The teacher prediction is
+# p_S(·|z(x)) — i.e. "self with extra reasoning support" — and we distill that
+# signal back into the bare-prompt student.
+#
+# Key files / classes:
+#   main:    ophsd.main_ophsd
+#   trainer: ophsd.ophsd_trainer.OPHSDTrainer
+#   worker:  ophsd.ophsd_worker.OPSDWorker  (sub-classes verl AsyncActorRolloutRefWorker;
+#            shares the OPSD batch builder & loss code).
+#
+# Usage:
+#   python -m ophsd.main_ophsd \
+#     --config-path ./config --config-name ophsd_trainer \
+#     benchmark=math \
+#     actor_rollout_ref.model.path=/path/to/Qwen3-8B \
+#     data.train_files=/path/to/train.parquet \
+#     data.val_files="['/path/to/val.parquet']" \
+#     harness.math.val_data_path=/path/to/val.parquet
+#
+# Supported benchmarks: lawbench | uspto | math
+# ============================================================================
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - actor@actor_rollout_ref.actor: dp_actor
+  - data@data: legacy_data
+  - ref@actor_rollout_ref.ref: dp_ref
+  - rollout@actor_rollout_ref.rollout: rollout
+  - model@actor_rollout_ref.model: hf_model
+  - critic@critic: dp_critic
+  - legacy_reward_impl
+  - reward@reward: reward
+  - _self_
+
+# ── Benchmark selection ─────────────────────────────────────────────────────
+# Drives both the default reward function and the harness wiring (see the
+# ``harness.{benchmark}`` sub-section below).
+benchmark: math
+
+data:
+  return_raw_chat: true
+  apply_chat_template_kwargs:
+    enable_thinking: true
+
+# ────────────────────────── Actor / Rollout / Ref ───────────────────────────
+actor_rollout_ref:
+  hybrid_engine: true
+  nccl_timeout: 600
+
+  model:
+    override_config:
+      attn_implementation: sdpa
+
+  rollout:
+    tensor_model_parallel_size: 1
+    name: vllm
+    mode: async
+    free_cache_engine: true
+    gpu_memory_utilization: 0.7
+    n: 1
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_model_len: 32768
+    checkpoint_engine:
+      update_weights_bucket_megabytes: 4096
+
+    val_kwargs:
+      n: 8                    # pass@8: 8 independent samples per val prompt
+      do_sample: true
+      temperature: 0.6
+      top_p: 0.8
+      top_k: 20
+
+  ref:
+    # The ``ref`` module is the harness *teacher*: we compute teacher logits
+    # against z(x) on this module.  Frozen at the base model — no in-place
+    # weight sync from the actor (teacher policy is fixed to the initial
+    # student following the OPSD paper).
+    fsdp_config:
+      param_offload: true
+
+# ─────────────────── Algorithm (schema-required, unused by OPHSD loss) ──────
+algorithm:
+  _target_: verl.trainer.config.AlgoConfig
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_penalty: kl
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+  use_pf_ppo: false
+  pf_ppo:
+    reweight_method: pow
+    weight_pow: 2.0
+
+# ─────────────────────── OPHSD / OPSD distillation ──────────────────────────
+opsd:
+  # Divergence type: ``reverse_kl`` | ``forward_kl`` | ``jsd``
+  loss_type: reverse_kl
+
+  # JSD interpolation parameter (only used when ``loss_type=jsd``; 0.5 is symmetric)
+  beta: 0.5
+
+  # Chunk size for memory-efficient divergence computation
+  chunk_size: 256
+
+  # Max sequence length for OPHSD training (teacher_prompt + response).  The
+  # student response (≤8192) plus the harness teacher prompt (p99 ≈ 2.7k) fits
+  # comfortably under 12288 for the math harness; raise if your prompts are larger.
+  max_length: 12288
+
+  # Optional system prompt for teacher.  ``null`` → behaviour controlled by the
+  # batch builder + the active harness.
+  teacher_system_prompt: null
+
+  # Reward-weighted distillation knobs (null/0 → uniform, recommended default)
+  reward_beta: null
+
+  # Subsample student rollouts to feed the distillation loss.  1.0 = use all.
+  sample_ratio: 1.0
+
+  # Entropy-weighted token sampling: ``alpha`` controls weighting strength.
+  # 0 → uniform; larger → favour higher-entropy student tokens.
+  entropy_alpha: 2.0
+
+  # JSD-on-top-k auxiliary regulariser (gamma=0 disables it).
+  jsd_gamma: 0.0
+  jsd_topk: 0
+
+# ─────────────────────── Reward (validation only, no RM) ────────────────────
+reward:
+  reward_model:
+    enable: false
+
+# ─────────────────────────────── Harness ────────────────────────────────────
+# The trainer reads:
+#   - top-level harness.* knobs (shared across all tasks: vLLM connection,
+#     concurrency, etc.)
+#   - the harness.{benchmark}.* sub-section that matches the run's
+#     ``benchmark`` value (e.g. ``benchmark=math`` → harness.math.*).
+# Every sub-section is *optional*; the defaults below match the paper setup.
+harness:
+  # ── Shared (vLLM connection + concurrency) ──
+  port: 8000
+  timeout: 1800
+  api_timeout: null      # null → inherit ``timeout``
+  model_name: Qwen3-8B
+  model_path: ${actor_rollout_ref.model.path}
+
+  workers: 100
+  val_workers: 100
+  val_n: 1               # independent harness runs per val question (pass@k)
+
+  # ── Math / DeepMath ── Plan-Solve harness ──
+  math:
+    val_data_path: ""        # JSON or parquet with {question, answer, solution}
+    use_gt: true             # plan agent sees reference solution; solve agent sees GT hint
+    plan_max_tokens: 4096    # plan agent budget (thinking-aware)
+    solve_max_tokens: 8192   # solve agent budget
+
+  # ── LawBench (CAIL-3-3) ── Draft-Verify harness ──
+  lawbench:
+    train_data_path: ""       # JSON for memory-bank seed (lawbench schema)
+    embeddings_path: ""       # .npy with pre-computed train embeddings
+    val_data_path: ""         # JSON for val prompts
+    val_embeddings_path: ""   # .npy with pre-computed val embeddings
+    embedding_model: "BAAI/bge-small-zh-v1.5"
+    draft_k: 5
+    confirm_k: 5
+    challenge_k: 5
+    cold_start_threshold: 10
+
+  # ── USPTO-50K ── Draft-Verify harness ──
+  uspto:
+    train_data_path: ""
+    embeddings_path: ""
+    val_data_path: ""
+    val_embeddings_path: ""
+    embedding_model: "BAAI/bge-small-zh-v1.5"
+    draft_k: 5
+    confirm_k: 5
+    challenge_k: 5
+    cold_start_threshold: 10
+
+# ─────────────────────────────── Trainer ────────────────────────────────────
+trainer:
+  balance_batch: false
+  total_epochs: 100          # effectively infinite; controlled by total_training_steps
+  total_training_steps: 150
+  project_name: ophsd
+  experiment_name: ophsd_training
+  logger: ["console"]
+  log_val_generations: 10
+  nnodes: 1
+  n_gpus_per_node: 8
+  save_freq: 10              # checkpoint every 10 steps
+  test_freq: 10              # validate every 10 steps
+  esi_redundant_time: 0
+  resume_mode: auto
+  resume_from_path: null
+  val_before_train: false
+  val_only: false
+  critic_warmup: 0
+  default_hdfs_dir: null
+  del_local_ckpt_after_load: false
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  ray_wait_register_center_timeout: 300
+  device: cuda
+  use_legacy_worker_impl: auto
+
+# ─────────────────────────────── Profiler ───────────────────────────────────
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null
+  steps: null
+  profile_continuous_steps: false
+  save_path: "outputs/profile"
+  discrete_range: []
+  global_tool_config:
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: false
+      controller_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+      worker_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+        capture-range: "cudaProfilerApi"
+        capture-range-end: null
+        kill: none
+    torch_memory:
+      trace_alloc_max_entries: 100000
+      stack_depth: 32
+      context: "all"
+      stacks: "all"
+      kw_args: {}
+
+# ───────────────────────────── TransferQueue ────────────────────────────────
+transfer_queue:
+  enable: false
+
+# ──────────────────────────────── Ray ───────────────────────────────────────
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+  timeline_json_file: null
